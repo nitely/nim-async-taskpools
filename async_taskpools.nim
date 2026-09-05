@@ -1,6 +1,6 @@
 {.push raises: [], gcsafe.}
 
-import std/[atomics, cpuinfo, macros, sysatomics]
+import std/[atomics, cpuinfo, macros]
 import pkg/chronos
 import pkg/taskpools
 
@@ -12,6 +12,7 @@ type
 
   InProgress = object
     count: Atomic[int]
+    closing: Atomic[bool]
     waiter: WaiterFuture
 
   AsyncTaskpool* = object
@@ -35,6 +36,14 @@ proc new*(
     inProgress: createShared(InProgress),
   )
 
+proc newOrDie*(
+    T: type AsyncTaskpool, numThreads = countProcessors()
+): AsyncTaskpool =
+  try:
+    T.new(numThreads)
+  except CatchableError as exc:
+    raiseAssert "AsyncTaskpool.new: " & exc.msg
+
 proc taskpool(atp: AsyncTaskpool): Taskpool =
   atp.tp
 
@@ -57,6 +66,8 @@ proc syncAll*(atp: AsyncTaskpool) {.async: (raises: []).} =
   await noCancel fut
 
 proc shutdown*(atp: AsyncTaskpool) {.async: (raises: []).} =
+  if atp.inProgress.closing.exchange(true, moAcquireRelease):
+    raiseAssert "AsyncTaskpool.shutdown called more than once"
   await atp.syncAll()
   var tp = atp.tp
   tp.shutdown()
@@ -93,6 +104,8 @@ proc newTaskFuture[T](): TaskFuture[T] =
 proc newAsyncTask[T](
     fut: TaskFuture[T], inProgress: ptr InProgress
 ): ref AsyncTask[T] =
+  if inProgress.closing.load(moAcquire):
+    raiseAssert "AsyncTaskpool.spawn on a pool that is shutting down"
   let task = new(AsyncTask[T])
   task.fut = fut
   task.inProgress = inProgress
@@ -125,7 +138,8 @@ macro spawn*(atp: AsyncTaskpool, fnCall: typed): untyped =
     retTy = fnCall.getTypeInst()
     hasRet = retTy.typeKind != ntyVoid
 
-  if fn.kind != nnkSym:
+  if fn.kind != nnkSym or
+      fn.symKind notin {nskProc, nskFunc, nskMethod, nskConverter}:
     error("spawn expects a call to a named proc", fnCall)
 
   let
