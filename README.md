@@ -2,7 +2,7 @@
 
 Async taskpools for Chronos - PoC
 
-Note it requires Chronos +4.4.1
+Note it requires Chronos dev or a version that contains [#694](https://github.com/status-im/nim-chronos/pull/694).
 
 ## Usage
 
