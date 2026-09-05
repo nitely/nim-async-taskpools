@@ -2,6 +2,7 @@
 
 Async taskpools for Chronos - PoC
 
+Note it requires Chronos +4.4.1
 
 ## Usage
 
