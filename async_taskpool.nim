@@ -1,6 +1,6 @@
 {.push raises: [], gcsafe.}
 
-import std/[atomics, cpuinfo, isolation, macros, sysatomics]
+import std/[atomics, cpuinfo, macros, sysatomics]
 import pkg/chronos
 import pkg/taskpools
 
