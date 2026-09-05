@@ -7,7 +7,7 @@ Async taskpools for Chronos - PoC
 
 ```nim
 import chronos
-import async_taskpool
+import async_taskpools
 
 proc greet(name: string): string =
   "hello " & name

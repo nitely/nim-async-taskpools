@@ -1,13 +1,13 @@
-# nim c --mm:orc -d:useMalloc -r test_async_taskpool.nim
+# nim c --mm:orc -d:useMalloc -r test_async_taskpools.nim
 #
 # ASan:
-# nim c --mm:orc -d:useMalloc --cc:clang --passc:-fsanitize=address --passl:-fsanitize=address --debugger:native -r test_async_taskpool.nim
+# nim c --mm:orc -d:useMalloc --cc:clang --passc:-fsanitize=address --passl:-fsanitize=address --debugger:native -r test_async_taskpools.nim
 # TSan:
-# nim c --mm:orc -d:taskpoolsTsan -d:useMalloc --cc:clang --passc:-fsanitize=thread --passl:-fsanitize=thread --debugger:native -r test_async_taskpool.nim
+# nim c --mm:orc -d:taskpoolsTsan -d:useMalloc --cc:clang --passc:-fsanitize=thread --passl:-fsanitize=thread --debugger:native -r test_async_taskpools.nim
 
 import std/[atomics, os]
 import pkg/chronos
-import ../async_taskpool
+import ../async_taskpools
 
 var checks = 0
 template check(cond: untyped) =
