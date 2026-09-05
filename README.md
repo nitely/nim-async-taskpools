@@ -15,6 +15,7 @@ proc greet(name: string): string =
 
 proc main() {.async.} =
   var tp = AsyncTaskpool.new(numThreads = 4)
+  defer: await tp.shutdown()
   let s = await tp.spawn greet("world")
   echo s
 

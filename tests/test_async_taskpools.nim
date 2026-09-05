@@ -137,8 +137,7 @@ proc main() {.async.} =
     let f = atp.spawn slow(50)
     await f.cancelAndWait()
     check f.cancelled()
-    atp.syncAll()
-    await sleepAsync(20.milliseconds)
+    await atp.syncAll()
 
   block:
     var ran: Atomic[int]
@@ -153,8 +152,7 @@ proc main() {.async.} =
       check f.cancelled()
     for f in blockers:
       check (await f) == 100
-    atp.syncAll()
-    await sleepAsync(20.milliseconds)
+    await atp.syncAll()
     check ran.load() == atp.numThreads
     for f in queued:
       check f.cancelled()
@@ -162,8 +160,7 @@ proc main() {.async.} =
   block:
     for i in 0 ..< 8:
       discard atp.spawn addUp(i, 1, 1)
-    atp.syncAll()
-    await sleepAsync(20.milliseconds)
+    await atp.syncAll()
     check true
 
   block:
@@ -176,8 +173,12 @@ proc main() {.async.} =
       total += await futs[i]
     check total == (N * (N - 1)) div 2 + 2 * N
 
-  atp.shutdown()
-  await sleepAsync(10.milliseconds)
+  block:
+    for i in 0 ..< 16:
+      discard atp.spawn slow(30)
+    check atp.pending > 0
+
+  await atp.shutdown()
 
 waitFor main()
 echo "ok (", checks, " checks)"

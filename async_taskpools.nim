@@ -8,13 +8,21 @@ when not compileOption("threads"):
   {.error: "async_taskpool requires --threads:on".}
 
 type
+  WaiterFuture = Future[void].Raising([CancelledError])
+
+  InProgress = object
+    count: Atomic[int]
+    waiter: WaiterFuture
+
   AsyncTaskpool* = object
     tp: Taskpool
+    inProgress: ptr InProgress
 
   TaskFuture*[T] = Future[T].Raising([CancelledError])
 
   AsyncTask[T] = object
     fut: TaskFuture[T]
+    inProgress: ptr InProgress
     cancelled: Atomic[bool]
     when T isnot void:
       fv: Flowvar[T]
@@ -22,19 +30,46 @@ type
 proc new*(
     T: type AsyncTaskpool, numThreads = countProcessors()
 ): AsyncTaskpool {.raises: [CatchableError].} =
-  AsyncTaskpool(tp: Taskpool.new(max(2, numThreads)))
+  AsyncTaskpool(
+    tp: Taskpool.new(max(2, numThreads)),
+    inProgress: createShared(InProgress),
+  )
 
 proc taskpool(atp: AsyncTaskpool): Taskpool =
   atp.tp
 
+proc inProgress(atp: AsyncTaskpool): ptr InProgress =
+  atp.inProgress
+
+proc pending*(atp: AsyncTaskpool): int =
+  atp.inProgress.count.load(moAcquire)
+
 proc numThreads*(atp: AsyncTaskpool): int =
   atp.tp.numThreads
 
-proc syncAll*(atp: AsyncTaskpool) =
-  atp.tp.syncAll()
+proc syncAll*(atp: AsyncTaskpool) {.async: (raises: []).} =
+  if atp.inProgress.count.load(moAcquire) == 0:
+    return
+  var fut = atp.inProgress.waiter
+  if fut.isNil:
+    fut = WaiterFuture.init("AsyncTaskpool.syncAll")
+    atp.inProgress.waiter = fut
+  await noCancel fut
 
-proc shutdown*(atp: var AsyncTaskpool) =
-  atp.tp.shutdown()
+proc shutdown*(atp: AsyncTaskpool) {.async: (raises: []).} =
+  await atp.syncAll()
+  var tp = atp.tp
+  tp.shutdown()
+  reset(atp.inProgress[])
+  deallocShared(atp.inProgress)
+
+proc taskDone(udata: pointer) {.nimcall, gcsafe, raises: [].} =
+  let inProgress = cast[ptr InProgress](udata)
+  if inProgress.count.fetchSub(1, moAcquireRelease) == 1 and
+      not inProgress.waiter.isNil:
+    let fut = inProgress.waiter
+    inProgress.waiter = nil
+    fut.complete()
 
 proc completeTask[T](udata: pointer) {.nimcall, gcsafe, raises: [].} =
   let task = cast[ref AsyncTask[T]](udata)
@@ -47,18 +82,24 @@ proc completeTask[T](udata: pointer) {.nimcall, gcsafe, raises: [].} =
     let res = sync(move task.fv)
     if not task.fut.finished():
       task.fut.complete(res)
+  let inProgress = task.inProgress
   task.fut.cancelCallback = nil
   GC_unref(task)
+  callSoon(taskDone, cast[pointer](inProgress))
 
 proc newTaskFuture[T](): TaskFuture[T] =
   TaskFuture[T].init("AsyncTaskpool.spawn")
 
-proc newAsyncTask[T](fut: TaskFuture[T]): ref AsyncTask[T] =
+proc newAsyncTask[T](
+    fut: TaskFuture[T], inProgress: ptr InProgress
+): ref AsyncTask[T] =
   let task = new(AsyncTask[T])
   task.fut = fut
+  task.inProgress = inProgress
   let raw = addr task[]
   fut.cancelCallback = proc(_: pointer) {.gcsafe, raises: [].} =
     raw.cancelled.store(true, moRelease)
+  discard inProgress.count.fetchAdd(1, moRelease)
   GC_ref(task)
   task
 
@@ -146,6 +187,7 @@ macro spawn*(atp: AsyncTaskpool, fnCall: typed): untyped =
   )
 
   let
+    atpVar = genSym(nskLet, "atp")
     dispVar = genSym(nskLet, "disp")
     fut = genSym(nskLet, "fut")
     task = genSym(nskLet, "task")
@@ -155,9 +197,12 @@ macro spawn*(atp: AsyncTaskpool, fnCall: typed): untyped =
 
   let
     newFut = newCall(nnkBracketExpr.newTree(bindSym"newTaskFuture", retTy))
-    newTaskCall =
-      newCall(nnkBracketExpr.newTree(bindSym"newAsyncTask", retTy), fut)
-    poolCall = newCall(bindSym"taskpool", atp)
+    newTaskCall = newCall(
+      nnkBracketExpr.newTree(bindSym"newAsyncTask", retTy),
+      fut,
+      newCall(bindSym"inProgress", atpVar),
+    )
+    poolCall = newCall(bindSym"taskpool", atpVar)
     dispCall = newCall(bindSym"handle", newCall(bindSym"getThreadDispatcher"))
     tpSpawnCall = newCall(bindSym"spawn", tpVar, spawnCall)
     runCall =
@@ -167,6 +212,7 @@ macro spawn*(atp: AsyncTaskpool, fnCall: typed): untyped =
     block:
       `taskProc`
       let
+        `atpVar` = `atp`
         `tpVar` = `poolCall`
         `dispVar` = `dispCall`
         `fut` = `newFut`
