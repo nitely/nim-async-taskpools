@@ -70,6 +70,8 @@ proc shutdown*(atp: AsyncTaskpool) {.async: (raises: []).} =
   if atp.closing.exchange(true, moAcquireRelease):
     raiseAssert "AsyncTaskpool.shutdown called more than once"
   await atp.syncAll()
+  if atp.count.load(moAcquire) != 0:
+    raiseAssert "AsyncTaskpool.shutdown: event loops exited with pending tasks"
   atp.tp.shutdown()
 
 proc taskDone[T](udata: pointer) {.nimcall, gcsafe, raises: [].} =
