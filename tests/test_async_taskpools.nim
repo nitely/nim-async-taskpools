@@ -178,6 +178,8 @@ proc main() {.async.} =
       discard atp.spawn slow(30)
     check atp.pending > 0
 
+  await atp.syncAll()
+  check atp.pending == 0
   await atp.shutdown()
 
 waitFor main()
