@@ -77,8 +77,10 @@ proc counted(ran: ptr Atomic[int], ms: int): int =
     sleep(ms)
   ms
 
+const NumThreads = 4
+
 proc main() {.async.} =
-  var atp = AsyncTaskpool.new(4)
+  var atp = AsyncTaskpool.new(NumThreads)
 
   check await atp.spawn isOneTwoThree(123)
   check not (await atp.spawn isOneTwoThree(456))
@@ -142,7 +144,7 @@ proc main() {.async.} =
   block:
     var ran: Atomic[int]
     var blockers: seq[TaskFuture[int]]
-    for i in 0 ..< atp.numThreads:
+    for i in 0 ..< NumThreads:
       blockers.add atp.spawn counted(addr ran, 100)
     var queued: seq[TaskFuture[int]]
     for i in 0 ..< 8:
@@ -153,7 +155,7 @@ proc main() {.async.} =
     for f in blockers:
       check (await f) == 100
     await atp.syncAll()
-    check ran.load() == atp.numThreads
+    check ran.load() == NumThreads
     for f in queued:
       check f.cancelled()
 

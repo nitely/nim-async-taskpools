@@ -14,7 +14,6 @@ type
     tp: Taskpool
     count: Atomic[int]
     closing: Atomic[bool]
-    waiter: WaiterFuture
 
   AsyncTaskpool* = ref AsyncTaskpoolObj
 
@@ -57,30 +56,19 @@ proc pending*(atp: AsyncTaskpool): int =
 proc pending*(atp: ptr AsyncTaskpoolObj): int =
   atp.count.load(moAcquire)
 
-proc numThreads*(atp: AsyncTaskpool): int =
-  atp.tp.numThreads
-
-proc numThreads*(atp: ptr AsyncTaskpoolObj): int =
-  atp.tp.numThreads
-
-proc drain*(T: type AsyncTaskpool) {.async: (raises: []).} =
+proc syncAll*(atp: ptr AsyncTaskpoolObj) {.async: (raises: []).} =
   if loopCount == 0:
     return
   if loopWaiter.isNil:
-    loopWaiter = WaiterFuture.init("AsyncTaskpool.drain")
+    loopWaiter = WaiterFuture.init("AsyncTaskpool.syncAll")
   await noCancel loopWaiter
 
 proc syncAll*(atp: AsyncTaskpool) {.async: (raises: []).} =
-  if atp.count.load(moAcquire) == 0:
-    return
-  if atp.waiter.isNil:
-    atp.waiter = WaiterFuture.init("AsyncTaskpool.syncAll")
-  await noCancel atp.waiter
+  await atp.handle.syncAll()
 
 proc shutdown*(atp: AsyncTaskpool) {.async: (raises: []).} =
   if atp.closing.exchange(true, moAcquireRelease):
     raiseAssert "AsyncTaskpool.shutdown called more than once"
-  await AsyncTaskpool.drain()
   await atp.syncAll()
   atp.tp.shutdown()
 
@@ -89,14 +77,11 @@ proc taskDone[T](udata: pointer) {.nimcall, gcsafe, raises: [].} =
     task = cast[ref AsyncTask[T]](udata)
     atp = task.atp
   GC_unref(task)
+  discard atp.count.fetchSub(1, moAcquireRelease)
   dec loopCount
   if loopCount == 0 and not loopWaiter.isNil:
     let fut = loopWaiter
     loopWaiter = nil
-    fut.complete()
-  if atp.count.fetchSub(1, moAcquireRelease) == 1 and not atp.waiter.isNil:
-    let fut = atp.waiter
-    atp.waiter = nil
     fut.complete()
 
 proc completeTask[T](udata: pointer) {.nimcall, gcsafe, raises: [].} =
@@ -252,5 +237,4 @@ macro spawn*(
 macro spawn*(
     atp: AsyncTaskpool, fnCall: typed
 ): untyped =
-  let handler = quote do: handle(atp)
-  spawnImpl(handler, fnCall)
+  spawnImpl(newCall(bindSym"handle", atp), fnCall)

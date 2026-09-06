@@ -37,8 +37,6 @@ type Loop = object
   id: int
 
 proc run(atp: ptr AsyncTaskpoolObj, id: int) {.async: (raises: []).} =
-  check atp.numThreads >= 2
-
   var futs: seq[TaskFuture[int]]
   for i in 0 ..< NumTasks:
     futs.add atp.spawn work(id * NumTasks + i)
@@ -59,7 +57,7 @@ proc run(atp: ptr AsyncTaskpoolObj, id: int) {.async: (raises: []).} =
   check (Moment.now() - t0).milliseconds < 100
   check running.cancelled()
 
-  await AsyncTaskpool.drain()
+  await atp.syncAll()
 
 proc loopThread(loop: Loop) {.thread, nimcall.} =
   waitFor run(loop.atp, loop.id)
