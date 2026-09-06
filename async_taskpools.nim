@@ -5,36 +5,39 @@ import pkg/chronos
 import pkg/taskpools
 
 when not compileOption("threads"):
-  {.error: "async_taskpool requires --threads:on".}
+  {.error: "async_taskpools requires --threads:on".}
 
 type
   WaiterFuture = Future[void].Raising([CancelledError])
 
-  InProgress = object
+  AsyncTaskpoolObj* = object
+    tp: Taskpool
     count: Atomic[int]
     closing: Atomic[bool]
-    waiter: WaiterFuture
 
-  AsyncTaskpool* = object
-    tp: Taskpool
-    inProgress: ptr InProgress
+  AsyncTaskpool* = ref AsyncTaskpoolObj
 
   TaskFuture*[T] = Future[T].Raising([CancelledError])
 
   AsyncTask[T] = object
+    atp: ptr AsyncTaskpoolObj
     fut: TaskFuture[T]
-    inProgress: ptr InProgress
     cancelled: Atomic[bool]
     when T isnot void:
       fv: Flowvar[T]
 
+var
+  loopCount {.threadvar.}: int
+  loopWaiter {.threadvar.}: WaiterFuture
+
+proc handle*(atp: AsyncTaskpool): ptr AsyncTaskpoolObj =
+  addr atp[]
+
 proc new*(
     T: type AsyncTaskpool, numThreads = countProcessors()
 ): AsyncTaskpool {.raises: [CatchableError].} =
-  AsyncTaskpool(
-    tp: Taskpool.new(max(2, numThreads)),
-    inProgress: createShared(InProgress),
-  )
+  result = AsyncTaskpool()
+  result.tp = Taskpool.new(max(2, numThreads))
 
 proc newOrDie*(
     T: type AsyncTaskpool, numThreads = countProcessors()
@@ -44,42 +47,43 @@ proc newOrDie*(
   except CatchableError as exc:
     raiseAssert "AsyncTaskpool.new: " & exc.msg
 
-proc taskpool(atp: AsyncTaskpool): Taskpool =
+proc taskpool(atp: ptr AsyncTaskpoolObj): Taskpool =
   atp.tp
 
-proc inProgress(atp: AsyncTaskpool): ptr InProgress =
-  atp.inProgress
-
 proc pending*(atp: AsyncTaskpool): int =
-  atp.inProgress.count.load(moAcquire)
+  atp.count.load(moAcquire)
 
-proc numThreads*(atp: AsyncTaskpool): int =
-  atp.tp.numThreads
+proc pending*(atp: ptr AsyncTaskpoolObj): int =
+  atp.count.load(moAcquire)
+
+proc syncAll*(atp: ptr AsyncTaskpoolObj) {.async: (raises: []).} =
+  if loopCount == 0:
+    return
+  if loopWaiter.isNil:
+    loopWaiter = WaiterFuture.init("AsyncTaskpool.syncAll")
+  await noCancel loopWaiter
 
 proc syncAll*(atp: AsyncTaskpool) {.async: (raises: []).} =
-  if atp.inProgress.count.load(moAcquire) == 0:
-    return
-  var fut = atp.inProgress.waiter
-  if fut.isNil:
-    fut = WaiterFuture.init("AsyncTaskpool.syncAll")
-    atp.inProgress.waiter = fut
-  await noCancel fut
+  await atp.handle.syncAll()
 
 proc shutdown*(atp: AsyncTaskpool) {.async: (raises: []).} =
-  if atp.inProgress.closing.exchange(true, moAcquireRelease):
+  if atp.closing.exchange(true, moAcquireRelease):
     raiseAssert "AsyncTaskpool.shutdown called more than once"
   await atp.syncAll()
-  var tp = atp.tp
-  tp.shutdown()
-  reset(atp.inProgress[])
-  deallocShared(atp.inProgress)
+  if atp.count.load(moAcquire) != 0:
+    raiseAssert "AsyncTaskpool.shutdown: event loops exited with pending tasks"
+  atp.tp.shutdown()
 
-proc taskDone(udata: pointer) {.nimcall, gcsafe, raises: [].} =
-  let inProgress = cast[ptr InProgress](udata)
-  if inProgress.count.fetchSub(1, moAcquireRelease) == 1 and
-      not inProgress.waiter.isNil:
-    let fut = inProgress.waiter
-    inProgress.waiter = nil
+proc taskDone[T](udata: pointer) {.nimcall, gcsafe, raises: [].} =
+  let
+    task = cast[ref AsyncTask[T]](udata)
+    atp = task.atp
+  GC_unref(task)
+  discard atp.count.fetchSub(1, moAcquireRelease)
+  dec loopCount
+  if loopCount == 0 and not loopWaiter.isNil:
+    let fut = loopWaiter
+    loopWaiter = nil
     fut.complete()
 
 proc completeTask[T](udata: pointer) {.nimcall, gcsafe, raises: [].} =
@@ -93,28 +97,25 @@ proc completeTask[T](udata: pointer) {.nimcall, gcsafe, raises: [].} =
     let res = sync(move task.fv)
     if not task.fut.finished():
       task.fut.complete(res)
-  let inProgress = task.inProgress
   task.fut.cancelCallback = nil
-  GC_unref(task)
-  callSoon(taskDone, cast[pointer](inProgress))
+  callSoon(taskDone[T], udata)
 
-proc newTaskFuture[T](): TaskFuture[T] =
-  TaskFuture[T].init("AsyncTaskpool.spawn")
-
-proc newAsyncTask[T](
-    fut: TaskFuture[T], inProgress: ptr InProgress
-): ref AsyncTask[T] =
-  if inProgress.closing.load(moAcquire):
+proc newAsyncTask[T](atp: ptr AsyncTaskpoolObj): ref AsyncTask[T] =
+  if atp.closing.load(moAcquire):
     raiseAssert "AsyncTaskpool.spawn on a pool that is shutting down"
   let task = new(AsyncTask[T])
-  task.fut = fut
-  task.inProgress = inProgress
+  task.atp = atp
+  task.fut = TaskFuture[T].init("AsyncTaskpool.spawn")
   let raw = addr task[]
-  fut.cancelCallback = proc(_: pointer) {.gcsafe, raises: [].} =
+  task.fut.cancelCallback = proc(_: pointer) {.gcsafe, raises: [].} =
     raw.cancelled.store(true, moRelease)
-  discard inProgress.count.fetchAdd(1, moRelease)
+  discard atp.count.fetchAdd(1, moRelease)
+  inc loopCount
   GC_ref(task)
   task
+
+proc taskFuture[T](task: ref AsyncTask[T]): TaskFuture[T] =
+  task.fut
 
 proc attach[T](task: ref AsyncTask[T], fv: sink Flowvar[T]) =
   task.fv = fv
@@ -130,7 +131,7 @@ proc notify[T](disp: DispatcherHandle, task: pointer) =
 
 {.pop.}
 
-macro spawn*(atp: AsyncTaskpool, fnCall: typed): untyped =
+proc spawnImpl(atp, fnCall: NimNode): NimNode =
   fnCall.expectKind(nnkCall)
 
   let
@@ -203,24 +204,20 @@ macro spawn*(atp: AsyncTaskpool, fnCall: typed): untyped =
   let
     atpVar = genSym(nskLet, "atp")
     dispVar = genSym(nskLet, "disp")
-    fut = genSym(nskLet, "fut")
     task = genSym(nskLet, "task")
     tpVar = genSym(nskLet, "tp")
   spawnCall.insert(1, dispVar)
   spawnCall.insert(2, newCall(bindSym"taskPtr", task))
 
   let
-    newFut = newCall(nnkBracketExpr.newTree(bindSym"newTaskFuture", retTy))
-    newTaskCall = newCall(
-      nnkBracketExpr.newTree(bindSym"newAsyncTask", retTy),
-      fut,
-      newCall(bindSym"inProgress", atpVar),
-    )
+    newTaskCall =
+      newCall(nnkBracketExpr.newTree(bindSym"newAsyncTask", retTy), atpVar)
     poolCall = newCall(bindSym"taskpool", atpVar)
     dispCall = newCall(bindSym"handle", newCall(bindSym"getThreadDispatcher"))
     tpSpawnCall = newCall(bindSym"spawn", tpVar, spawnCall)
     runCall =
       if hasRet: newCall(bindSym"attach", task, tpSpawnCall) else: tpSpawnCall
+    futCall = newCall(bindSym"taskFuture", task)
 
   result = quote do:
     block:
@@ -229,8 +226,17 @@ macro spawn*(atp: AsyncTaskpool, fnCall: typed): untyped =
         `atpVar` = `atp`
         `tpVar` = `poolCall`
         `dispVar` = `dispCall`
-        `fut` = `newFut`
         `task` = `newTaskCall`
       `runCall`
-      `fut`
+      `futCall`
   # echo result.toStrLit()
+
+macro spawn*(
+    atp: ptr AsyncTaskpoolObj, fnCall: typed
+): untyped =
+  spawnImpl(atp, fnCall)
+
+macro spawn*(
+    atp: AsyncTaskpool, fnCall: typed
+): untyped =
+  spawnImpl(newCall(bindSym"handle", atp), fnCall)
