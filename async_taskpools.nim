@@ -1,3 +1,6 @@
+# Copyright (c) 2026 Esteban C Borsani - @nitely
+# License: MIT
+
 {.push raises: [], gcsafe.}
 
 import std/[atomics, cpuinfo, macros]
@@ -36,8 +39,7 @@ proc handle*(atp: AsyncTaskpool): ptr AsyncTaskpoolObj =
 proc new*(
     T: type AsyncTaskpool, numThreads = countProcessors()
 ): AsyncTaskpool {.raises: [CatchableError].} =
-  result = AsyncTaskpool()
-  result.tp = Taskpool.new(max(2, numThreads))
+  AsyncTaskpool(tp: Taskpool.new(max(2, numThreads)))
 
 proc newOrDie*(
     T: type AsyncTaskpool, numThreads = countProcessors()
@@ -50,11 +52,11 @@ proc newOrDie*(
 proc taskpool(atp: ptr AsyncTaskpoolObj): Taskpool =
   atp.tp
 
-proc pending*(atp: AsyncTaskpool): int =
-  atp.count.load(moAcquire)
-
 proc pending*(atp: ptr AsyncTaskpoolObj): int =
   atp.count.load(moAcquire)
+
+proc pending*(atp: AsyncTaskpool): int =
+  atp.handle().pending()
 
 proc syncAll*(atp: ptr AsyncTaskpoolObj) {.async: (raises: []).} =
   if loopCount == 0:
@@ -63,8 +65,8 @@ proc syncAll*(atp: ptr AsyncTaskpoolObj) {.async: (raises: []).} =
     loopWaiter = WaiterFuture.init("AsyncTaskpool.syncAll")
   await noCancel loopWaiter
 
-proc syncAll*(atp: AsyncTaskpool) {.async: (raises: []).} =
-  await atp.handle.syncAll()
+proc syncAll*(atp: AsyncTaskpool): Future[void] {.async: (raw: true, raises: []).} =
+  atp.handle.syncAll()
 
 proc shutdown*(atp: AsyncTaskpool) {.async: (raises: []).} =
   if atp.closing.exchange(true, moAcquireRelease):
@@ -75,16 +77,14 @@ proc shutdown*(atp: AsyncTaskpool) {.async: (raises: []).} =
   atp.tp.shutdown()
 
 proc taskDone[T](udata: pointer) {.nimcall, gcsafe, raises: [].} =
-  let
-    task = cast[ref AsyncTask[T]](udata)
-    atp = task.atp
+  let task = cast[ref AsyncTask[T]](udata)
+  let atp = task.atp
   GC_unref(task)
   discard atp.count.fetchSub(1, moAcquireRelease)
   dec loopCount
   if loopCount == 0 and not loopWaiter.isNil:
-    let fut = loopWaiter
+    loopWaiter.complete()
     loopWaiter = nil
-    fut.complete()
 
 proc completeTask[T](udata: pointer) {.nimcall, gcsafe, raises: [].} =
   let task = cast[ref AsyncTask[T]](udata)
@@ -140,7 +140,7 @@ proc spawnImpl(atp, fnCall: NimNode): NimNode =
     hasRet = retTy.typeKind != ntyVoid
 
   if fn.kind != nnkSym or
-      fn.symKind notin {nskProc, nskFunc, nskMethod, nskConverter}:
+      fn.symKind notin {nskProc, nskFunc}:
     error("spawn expects a call to a named proc", fnCall)
 
   let
